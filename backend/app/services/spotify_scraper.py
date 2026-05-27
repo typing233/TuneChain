@@ -27,7 +27,7 @@ class SpotifyTrackMeta:
 
 @dataclass
 class SpotifyParsedResult:
-    type: str  # "track" | "album" | "playlist"
+    type: str
     tracks: list[SpotifyTrackMeta]
 
 
@@ -61,52 +61,60 @@ async def _fetch_embed_page(path: str) -> str:
     return resp.text
 
 
-def _extract_next_data(html: str) -> dict | None:
+def _extract_entity(html: str) -> dict:
     soup = BeautifulSoup(html, "html.parser")
     script = soup.find("script", id="__NEXT_DATA__")
-    if script and script.string:
-        return json.loads(script.string)
-    return None
+    if not script or not script.string:
+        raise ValueError("Could not find __NEXT_DATA__ in embed page")
+    data = json.loads(script.string)
+    try:
+        return data["props"]["pageProps"]["state"]["data"]["entity"]
+    except (KeyError, TypeError) as e:
+        raise ValueError(f"Unexpected embed page structure: {e}")
 
 
-def _extract_resource_from_html(html: str) -> dict | None:
-    soup = BeautifulSoup(html, "html.parser")
-    for script in soup.find_all("script"):
-        if script.string and "Spotify.Entity" in script.string:
-            match = re.search(r"Spotify\.Entity\s*=\s*(\{.+?\});", script.string, re.DOTALL)
-            if match:
-                return json.loads(match.group(1))
-    resource_script = soup.find("script", {"type": "application/json"})
-    if resource_script and resource_script.string:
-        try:
-            data = json.loads(resource_script.string)
-            return data
-        except (json.JSONDecodeError, TypeError):
-            pass
-    return None
+def _get_cover_url(entity: dict) -> str:
+    vi = entity.get("visualIdentity", {})
+    images = vi.get("image", [])
+    if images:
+        largest = max(images, key=lambda i: i.get("maxHeight", 0))
+        return largest.get("url", "")
+    return ""
 
 
-def _parse_track_from_entity(entity: dict, fallback_album: str = "", fallback_year: int | None = None) -> SpotifyTrackMeta:
-    title = entity.get("name", "Unknown")
-    artists = entity.get("artists", [])
-    artist = ", ".join(a.get("name", "") for a in artists) if artists else "Unknown"
-    album_data = entity.get("album", {})
-    album = album_data.get("name", fallback_album) if album_data else fallback_album
-    year = None
-    release_date = album_data.get("release_date", "") if album_data else ""
+def _get_year_from_release_date(release_date: dict | None) -> int | None:
     if not release_date:
-        release_date = entity.get("release_date", "")
-    if release_date:
+        return None
+    iso = release_date.get("isoString", "")
+    if iso and len(iso) >= 4:
         try:
-            year = int(release_date[:4])
-        except (ValueError, IndexError):
-            year = fallback_year
-    else:
-        year = fallback_year
-    duration_ms = entity.get("duration_ms", 0)
-    images = entity.get("album", {}).get("images", []) if entity.get("album") else entity.get("images", [])
-    cover_art_url = images[0].get("url", "") if images else ""
-    spotify_id = entity.get("id", entity.get("uri", "").split(":")[-1])
+            return int(iso[:4])
+        except ValueError:
+            return None
+    return None
+
+
+def _extract_spotify_id_from_uri(uri: str) -> str:
+    parts = uri.split(":")
+    return parts[-1] if parts else ""
+
+
+async def _scrape_track(spotify_id: str) -> SpotifyTrackMeta:
+    html = await _fetch_embed_page(f"track/{spotify_id}")
+    entity = _extract_entity(html)
+
+    title = entity.get("name", "") or entity.get("title", "")
+    artists_list = entity.get("artists", [])
+    artist = ", ".join(a.get("name", "") for a in artists_list) if artists_list else "Unknown"
+    year = _get_year_from_release_date(entity.get("releaseDate"))
+    duration_ms = entity.get("duration", 0)
+    cover_art_url = _get_cover_url(entity)
+
+    # Album name is not directly available in track embed pages.
+    # We use the title field from the cover alt tag as a fallback, but it's the track title.
+    # Album name cannot be reliably extracted from embed-only scraping for single tracks.
+    album = ""
+
     return SpotifyTrackMeta(
         title=title,
         artist=artist,
@@ -118,112 +126,76 @@ def _parse_track_from_entity(entity: dict, fallback_album: str = "", fallback_ye
     )
 
 
-async def _scrape_track(spotify_id: str) -> SpotifyTrackMeta:
-    html = await _fetch_embed_page(f"track/{spotify_id}")
-    next_data = _extract_next_data(html)
-    if next_data:
-        try:
-            entity = next_data["props"]["pageProps"]["state"]["data"]["entity"]
-            return _parse_track_from_entity(entity)
-        except (KeyError, TypeError):
-            pass
-    entity = _extract_resource_from_html(html)
-    if entity:
-        return _parse_track_from_entity(entity)
-    return _parse_track_from_og_tags(html, spotify_id)
-
-
-def _parse_track_from_og_tags(html: str, spotify_id: str) -> SpotifyTrackMeta:
-    soup = BeautifulSoup(html, "html.parser")
-    title = ""
-    artist = ""
-    og_title = soup.find("meta", property="og:title")
-    if og_title:
-        content = og_title.get("content", "")
-        title = str(content)
-    og_desc = soup.find("meta", property="og:description")
-    if og_desc:
-        artist = str(og_desc.get("content", ""))
-    og_image = soup.find("meta", property="og:image")
-    cover_art_url = str(og_image.get("content", "")) if og_image else ""
-    return SpotifyTrackMeta(
-        title=title or "Unknown",
-        artist=artist or "Unknown",
-        album="",
-        year=None,
-        duration_ms=0,
-        cover_art_url=cover_art_url,
-        spotify_id=spotify_id,
-    )
-
-
 async def _scrape_album(spotify_id: str) -> list[SpotifyTrackMeta]:
     html = await _fetch_embed_page(f"album/{spotify_id}")
-    next_data = _extract_next_data(html)
-    tracks: list[SpotifyTrackMeta] = []
-    if next_data:
+    entity = _extract_entity(html)
+
+    album_name = entity.get("name", "") or entity.get("title", "")
+    album_artist = entity.get("subtitle", "") or "Unknown"
+    cover_art_url = _get_cover_url(entity)
+
+    track_list = entity.get("trackList", [])
+    if not track_list:
+        raise ValueError("Album embed page returned no tracks")
+
+    # Fetch the first track's embed page to get the release year
+    year: int | None = None
+    first_track_uri = track_list[0].get("uri", "")
+    first_track_id = _extract_spotify_id_from_uri(first_track_uri)
+    if first_track_id:
         try:
-            entity = next_data["props"]["pageProps"]["state"]["data"]["entity"]
-            album_name = entity.get("name", "")
-            year = None
-            rd = entity.get("release_date", "")
-            if rd:
-                try:
-                    year = int(rd[:4])
-                except (ValueError, IndexError):
-                    pass
-            images = entity.get("images", [])
-            cover = images[0].get("url", "") if images else ""
-            track_list = entity.get("tracks", {}).get("items", [])
-            for t in track_list:
-                track = _parse_track_from_entity(t, fallback_album=album_name, fallback_year=year)
-                if not track.cover_art_url:
-                    track.cover_art_url = cover
-                if not track.album:
-                    track.album = album_name
-                tracks.append(track)
-            return tracks
-        except (KeyError, TypeError) as e:
-            logger.warning(f"Failed to parse album next_data: {e}")
-    entity = _extract_resource_from_html(html)
-    if entity:
-        album_name = entity.get("name", "")
-        year = None
-        rd = entity.get("release_date", "")
-        if rd:
-            try:
-                year = int(rd[:4])
-            except (ValueError, IndexError):
-                pass
-        images = entity.get("images", [])
-        cover = images[0].get("url", "") if images else ""
-        for t in entity.get("tracks", {}).get("items", []):
-            track = _parse_track_from_entity(t, fallback_album=album_name, fallback_year=year)
-            if not track.cover_art_url:
-                track.cover_art_url = cover
-            tracks.append(track)
+            first_track_html = await _fetch_embed_page(f"track/{first_track_id}")
+            first_entity = _extract_entity(first_track_html)
+            year = _get_year_from_release_date(first_entity.get("releaseDate"))
+        except Exception as e:
+            logger.warning(f"Could not fetch year from first track: {e}")
+
+    tracks: list[SpotifyTrackMeta] = []
+    for item in track_list:
+        track_uri = item.get("uri", "")
+        track_id = _extract_spotify_id_from_uri(track_uri)
+        title = item.get("title", "")
+        artist = item.get("subtitle", "") or album_artist
+        duration_ms = item.get("duration", 0)
+
+        tracks.append(SpotifyTrackMeta(
+            title=title,
+            artist=artist,
+            album=album_name,
+            year=year,
+            duration_ms=duration_ms,
+            cover_art_url=cover_art_url,
+            spotify_id=track_id or track_uri,
+        ))
+
     return tracks
 
 
 async def _scrape_playlist(spotify_id: str) -> list[SpotifyTrackMeta]:
     html = await _fetch_embed_page(f"playlist/{spotify_id}")
-    next_data = _extract_next_data(html)
+    entity = _extract_entity(html)
+
+    cover_art_url = _get_cover_url(entity)
+    track_list = entity.get("trackList", [])
+    if not track_list:
+        raise ValueError("Playlist embed page returned no tracks")
+
     tracks: list[SpotifyTrackMeta] = []
-    if next_data:
-        try:
-            entity = next_data["props"]["pageProps"]["state"]["data"]["entity"]
-            track_list = entity.get("tracks", {}).get("items", [])
-            for item in track_list:
-                t = item.get("track", item)
-                track = _parse_track_from_entity(t)
-                tracks.append(track)
-            return tracks
-        except (KeyError, TypeError) as e:
-            logger.warning(f"Failed to parse playlist next_data: {e}")
-    entity = _extract_resource_from_html(html)
-    if entity:
-        for item in entity.get("tracks", {}).get("items", []):
-            t = item.get("track", item)
-            track = _parse_track_from_entity(t)
-            tracks.append(track)
+    for item in track_list:
+        track_uri = item.get("uri", "")
+        track_id = _extract_spotify_id_from_uri(track_uri)
+        title = item.get("title", "")
+        artist = item.get("subtitle", "") or "Unknown"
+        duration_ms = item.get("duration", 0)
+
+        tracks.append(SpotifyTrackMeta(
+            title=title,
+            artist=artist,
+            album="",
+            year=None,
+            duration_ms=duration_ms,
+            cover_art_url=cover_art_url,
+            spotify_id=track_id or track_uri,
+        ))
+
     return tracks

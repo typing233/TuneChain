@@ -9,7 +9,7 @@ export function useWebSocket() {
 
   const connect = useCallback(() => {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const wsUrl = `${protocol}//${window.location.host}/ws/progress/all`
+    const wsUrl = `${protocol}//${window.location.host}/ws/progress`
 
     const ws = new WebSocket(wsUrl)
     wsRef.current = ws
